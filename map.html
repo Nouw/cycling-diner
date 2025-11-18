@@ -169,10 +169,35 @@
           source: 'duos',
           filter: ['!', ['has', 'point_count']],
           paint: {
-            'circle-radius': 7,
+            'circle-radius': [
+              'interpolate', ['linear'], ['coalesce', ['get','stack'], 1],
+              1, 6,
+              2, 8,
+              3, 9.5,
+              4, 11,
+              6, 13,
+              10, 15
+            ],
             'circle-color': '#e11d48',
             'circle-stroke-color': '#ffffff',
             'circle-stroke-width': 1.5
+          }
+        });
+        // Duplicate count labels for exact same-location points
+        map.addLayer({
+          id: 'dupe-count',
+          type: 'symbol',
+          source: 'duos',
+          filter: ['all', ['!', ['has','point_count']], ['>', ['coalesce', ['get','stack'], 1], 1]],
+          layout: {
+            'text-field': ['to-string', ['get','stack']],
+            'text-size': 11,
+            'text-font': ['DIN Pro Medium', 'Arial Unicode MS Bold']
+          },
+          paint: {
+            'text-color': '#0f172a',
+            'text-halo-color': '#ffffff',
+            'text-halo-width': 1.2
           }
         });
       }
@@ -181,6 +206,7 @@
         const safe = (v) => (v == null || v === '' ? '-' : String(v));
         const rows = [
           ['Namen', `${safe(props.naamA)} & ${safe(props.naamB)}`],
+          ['Aantal', props.stack && Number(props.stack) > 1 ? String(props.stack) : '1'],
           ['Adres', `${safe(props.adres)} ${safe(props.postcode)}`],
           ['Team', `${safe(props.teamA)} / ${safe(props.teamB)}`],
           ['Dieet', safe(props.dieet)],
@@ -203,14 +229,46 @@
         map.on('mouseenter', 'clusters', () => { map.getCanvas().style.cursor = 'pointer'; });
         map.on('mouseleave', 'clusters', () => { map.getCanvas().style.cursor = ''; });
 
-        // Popups for points
+        // Popups and spiderify for points
         const popup = new mapboxgl.Popup({ closeButton: true, closeOnClick: true });
         map.on('click', 'unclustered', (e) => {
           const feature = e.features && e.features[0];
           if (!feature) return;
-          const html = makePopupHTML(feature.properties || {});
-          popup.setLngLat(feature.geometry.coordinates).setHTML(html).addTo(map);
+          const props = feature.properties || {};
+          const coords = feature.geometry && feature.geometry.coordinates;
+          if (props && Number(props.stack) > 1 && Array.isArray(coords)) {
+            const key = coords[0].toFixed(6) + ',' + coords[1].toFixed(6);
+            spiderifyAt(coords, key);
+            return;
+          }
+          clearSpiderify();
+          const html = makePopupHTML(props);
+          popup.setLngLat(coords).setHTML(html).addTo(map);
         });
+        // Popup for spider points
+        map.on('click', 'spider-points', (e) => {
+          const f = e.features && e.features[0];
+          if (!f) return;
+          const html = makePopupHTML(f.properties || {});
+          popup.setLngLat(f.geometry.coordinates).setHTML(html).addTo(map);
+        });
+        // Close spiderify and popup when clicking on bare map background
+        map.on('click', (e) => {
+          const layerIds = [];
+          if (map.getLayer('unclustered')) layerIds.push('unclustered');
+          if (map.getLayer('spider-points')) layerIds.push('spider-points');
+          if (map.getLayer('clusters')) layerIds.push('clusters');
+          let hits = [];
+          if (layerIds.length) {
+            hits = map.queryRenderedFeatures(e.point, { layers: layerIds });
+          }
+          if (!hits || hits.length === 0) {
+            clearSpiderify();
+            try { popup.remove(); } catch (_) {}
+          }
+        });
+        // Recompute spider positions on move/zoom
+        map.on('move', () => { updateSpiderPositions(); });
         map.on('mouseenter', 'unclustered', () => { map.getCanvas().style.cursor = 'pointer'; });
         map.on('mouseleave', 'unclustered', () => { map.getCanvas().style.cursor = ''; });
       }
@@ -239,6 +297,7 @@
         // Remove layers and source (order matters)
         removeIfExists('cluster-count', 'layer');
         removeIfExists('clusters', 'layer');
+        removeIfExists('dupe-count', 'layer');
         removeIfExists('unclustered', 'layer');
         removeIfExists('duos', 'source');
 
@@ -250,6 +309,97 @@
           clusterRadius: 50
         });
         addLayers(!!clusterEnabled);
+        ensureSpiderLayers();
+        clearSpiderify();
+      }
+
+      function computeStacks(geojson) {
+        try {
+          const mapCounts = new Map();
+          (geojson.features || []).forEach(f => {
+            if (!f || !f.geometry || f.geometry.type !== 'Point') return;
+            const c = f.geometry.coordinates;
+            if (!Array.isArray(c) || c.length < 2) return;
+            const key = c[0].toFixed(6) + ',' + c[1].toFixed(6);
+            mapCounts.set(key, (mapCounts.get(key) || 0) + 1);
+          });
+          (geojson.features || []).forEach(f => {
+            if (!f || !f.geometry || f.geometry.type !== 'Point') return;
+            const c = f.geometry.coordinates;
+            if (!Array.isArray(c) || c.length < 2) return;
+            const key = c[0].toFixed(6) + ',' + c[1].toFixed(6);
+            const count = mapCounts.get(key) || 1;
+            f.properties = Object.assign({}, f.properties, { stack: count });
+          });
+        } catch (e) { /* ignore */ }
+        return geojson;
+      }
+
+      // Index features by exact coordinate (rounded) for spiderify
+      let stackIndex = new Map();
+      function buildStackIndex(geojson) {
+        stackIndex = new Map();
+        (geojson.features || []).forEach((f, idx) => {
+          if (!f || !f.geometry || f.geometry.type !== 'Point') return;
+          const c = f.geometry.coordinates;
+          if (!Array.isArray(c) || c.length < 2) return;
+          const key = c[0].toFixed(6) + ',' + c[1].toFixed(6);
+          if (!stackIndex.has(key)) stackIndex.set(key, []);
+          stackIndex.get(key).push({ feature: f, index: idx });
+        });
+      }
+
+      // Spiderify: fan out overlapping points around a clicked location
+      function ensureSpiderLayers() {
+        if (!map.getSource('spider-points')) {
+          map.addSource('spider-points', { type: 'geojson', data: { type:'FeatureCollection', features: [] } });
+        }
+        if (!map.getSource('spider-lines')) {
+          map.addSource('spider-lines', { type: 'geojson', data: { type:'FeatureCollection', features: [] } });
+        }
+        if (!map.getLayer('spider-lines')) {
+          map.addLayer({ id:'spider-lines', type:'line', source:'spider-lines', paint:{ 'line-color':'#64748b','line-width':1.2,'line-opacity':0.8 } });
+        }
+        if (!map.getLayer('spider-points')) {
+          map.addLayer({ id:'spider-points', type:'circle', source:'spider-points', paint:{ 'circle-radius':6.5,'circle-color':'#e11d48','circle-stroke-color':'#ffffff','circle-stroke-width':1.2 } });
+        }
+      }
+
+      let spiderState = null; // { key, center:[lng,lat], items:[{feature,index}], radiusPx }
+      function clearSpiderify() {
+        spiderState = null;
+        if (map.getSource('spider-points')) map.getSource('spider-points').setData({ type:'FeatureCollection', features: [] });
+        if (map.getSource('spider-lines')) map.getSource('spider-lines').setData({ type:'FeatureCollection', features: [] });
+      }
+
+      function spiderifyAt(centerLngLat, key) {
+        ensureSpiderLayers();
+        const group = stackIndex.get(key) || [];
+        if (group.length <= 1) { clearSpiderify(); return; }
+        spiderState = { key, center: centerLngLat, items: group, radiusPx: Math.min(40 + group.length * 2, 80) };
+        updateSpiderPositions();
+      }
+
+      function updateSpiderPositions() {
+        if (!spiderState) return;
+        const { center, items, radiusPx } = spiderState;
+        const centerPt = map.project(center);
+        const N = items.length;
+        const angleStep = (Math.PI * 2) / N;
+        const pointFeatures = [];
+        const lineFeatures = [];
+        for (let i = 0; i < N; i++) {
+          const angle = i * angleStep;
+          const pt = { x: centerPt.x + radiusPx * Math.cos(angle), y: centerPt.y + radiusPx * Math.sin(angle) };
+          const lngLat = map.unproject(pt);
+          const orig = items[i].feature;
+          const props = Object.assign({}, orig.properties || {}, { spider:true, spiderIndex:i });
+          pointFeatures.push({ type:'Feature', geometry:{ type:'Point', coordinates:[lngLat.lng, lngLat.lat] }, properties: props });
+          lineFeatures.push({ type:'Feature', geometry:{ type:'LineString', coordinates:[ center, [lngLat.lng, lngLat.lat] ] }, properties:{} });
+        }
+        map.getSource('spider-points').setData({ type:'FeatureCollection', features: pointFeatures });
+        map.getSource('spider-lines').setData({ type:'FeatureCollection', features: lineFeatures });
+        applyGroupStyling();
       }
 
       // Custom groups state
@@ -278,7 +428,11 @@
       function applyGroupStyling() {
         if (!map.getLayer('unclustered')) return;
         const names = Array.from(new Set((sourceData.features||[]).map(f => f.properties && f.properties.group).filter(Boolean)));
-        map.setPaintProperty('unclustered', 'circle-color', getGroupPalette(names));
+        const expr = getGroupPalette(names);
+        map.setPaintProperty('unclustered', 'circle-color', expr);
+        if (map.getLayer('spider-points')) {
+          map.setPaintProperty('spider-points', 'circle-color', expr);
+        }
       }
 
       function recalcAssignments() {
@@ -304,6 +458,7 @@
         }
         applyGroupStyling();
         persistCustom();
+        buildStackIndex(sourceData);
       }
 
       function persistCustom() {
@@ -452,9 +607,10 @@
             const file = e.target.files && e.target.files[0];
             if (!file) return;
             try {
-              const data = await readGeoJSONFile(file);
+              let data = await readGeoJSONFile(file);
               if (!data || data.type !== 'FeatureCollection') throw new Error('Expected a GeoJSON FeatureCollection');
-              sourceData = data;
+              sourceData = computeStacks(data);
+              buildStackIndex(sourceData);
               const clusterPref = localStorage.getItem('CLUSTER_ENABLED');
               const clusterEnabled = clusterPref == null ? true : clusterPref === 'true';
               clusterToggle.checked = clusterEnabled;
