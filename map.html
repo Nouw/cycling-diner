@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cycling Diner — Utrecht Map</title>
+    <link href="https://unpkg.com/mapbox-gl@2.15.0/dist/mapbox-gl.css" rel="stylesheet" />
+    <link href="https://unpkg.com/@mapbox/mapbox-gl-draw@1.5.0/dist/mapbox-gl-draw.css" rel="stylesheet" />
+    <style>
+      html, body { height: 100%; margin: 0; }
+      #map { position: absolute; inset: 0; }
+      .topbar {
+        position: absolute; top: 10px; left: 10px; z-index: 2;
+        background: rgba(255,255,255,0.9); border-radius: 8px; padding: 8px 10px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+        display: flex; gap: 8px; align-items: center; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+      .topbar input[type="text"] { width: 360px; }
+      .badge { font-size: 12px; color: #555; }
+      .sep { width:1px; height:16px; background:#ddd; display:inline-block; margin:0 6px; }
+      .popup { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 13px; }
+      .popup b { display: inline-block; min-width: 72px; }
+      /* Group panel */
+      #groupPanel {
+        position: absolute; bottom: 60px; right: 10px; z-index: 2;
+        background: rgba(255,255,255,0.95); border-radius: 8px; padding: 8px 10px; max-width: 320px; max-height: 50vh; overflow: auto;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.15); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; font-size: 13px;
+      }
+      #groupPanel h4 { margin: 6px 0 8px; font-size: 13px; font-weight: 600; color:#0f172a; }
+      #groupList { margin: 0; padding: 0; list-style: none; }
+      #groupList li { display:flex; justify-content: space-between; align-items:center; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eee; }
+      #groupList li:last-child { border-bottom: 0; }
+      .pill { display:inline-block; padding: 2px 6px; border-radius: 999px; background:#f1f5f9; color:#0f172a; font-size: 12px; }
+      .panel-actions { display:flex; gap:6px; margin-top:6px; }
+    </style>
+  </head>
+  <body>
+    <div class="topbar">
+      <label for="token">Mapbox token:</label>
+      <input id="token" type="text" placeholder="pk.XXXX…" />
+      <button id="saveToken">Save</button>
+      <button id="clearToken" title="Remove stored token">Clear</button>
+      <input id="fileGeoJSON" type="file" accept=".geojson,application/geo+json,application/json" />
+      <label style="margin-left:10px"><input type="checkbox" id="clusterToggle" checked disabled /> Cluster</label>
+      <span class="sep"></span>
+      <label title="Draw polygons to define your own groups"><input type="checkbox" id="customToggle" disabled /> Custom groups</label>
+      <button id="exportGroups" title="Download CSV with group assignments" style="display:none;">Export CSV</button>
+      <button id="clearGroups" title="Remove drawn polygons and assignments" style="display:none;">Clear groups</button>
+      <span class="badge">Style: streets-v12 (light)</span>
+    </div>
+    <div id="map"></div>
+    <div id="groupPanel" style="display:none;">
+      <h4>Custom groups</h4>
+      <ul id="groupList"></ul>
+      <div class="panel-actions">
+        <button id="panelExport" title="Download CSV with group assignments">Export CSV</button>
+        <button id="panelClear" title="Remove drawn polygons and assignments">Clear</button>
+      </div>
+    </div>
+
+    <script src="https://unpkg.com/mapbox-gl@2.15.0/dist/mapbox-gl.js"></script>
+    <script src="https://unpkg.com/@mapbox/mapbox-gl-draw@1.4.2/dist/mapbox-gl-draw.js"></script>
+    <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+    <script>
+      if (!window.mapboxgl) {
+        console.error('Mapbox GL JS failed to load. Check network/CDN access.');
+        alert('Map library failed to load. If a network block is in place, allow unpkg.com or switch to a different CDN.');
+      }
+    </script>
+    <script>
+      // Helper: get token from URL (?token=) or localStorage
+      function getToken() {
+        const params = new URLSearchParams(location.search);
+        return params.get('token') || localStorage.getItem('MAPBOX_TOKEN') || '';
+      }
+      function saveToken(t) { localStorage.setItem('MAPBOX_TOKEN', t); }
+      function clearToken() { localStorage.removeItem('MAPBOX_TOKEN'); }
+
+      // Wire token UI
+      const tokenInput = document.getElementById('token');
+      const saveBtn = document.getElementById('saveToken');
+      const tokenClearBtn = document.getElementById('clearToken');
+      tokenInput.value = getToken();
+      saveBtn.onclick = () => { saveToken(tokenInput.value.trim()); location.reload(); };
+      tokenClearBtn.onclick = () => { clearToken(); location.reload(); };
+
+      const token = getToken();
+      if (!token) {
+        console.warn('No Mapbox token. Enter it at the top.');
+      }
+      mapboxgl.accessToken = token || 'pk.placeholder_no_token';
+
+      const center = [5.1214201, 52.0907374]; // Utrecht
+      const map = new mapboxgl.Map({
+        container: 'map',
+        style: 'mapbox://styles/mapbox/streets-v12',
+        center, zoom: 11.5,
+        attributionControl: true
+      });
+      map.addControl(new mapboxgl.NavigationControl({ showCompass: false }));
+
+      // Drawing control (polygons only)
+      const Draw = new MapboxDraw({
+        displayControlsDefault: false,
+        controls: { polygon: true, trash: true },
+        defaultMode: 'draw_polygon'
+      });
+      map.addControl(Draw, 'top-right');
+      let drawControlEl = null;
+      setTimeout(() => {
+        drawControlEl = document.querySelector('.mapbox-gl-draw_ctrl.mapbox-gl-ctrl');
+        if (drawControlEl) drawControlEl.style.display = 'none';
+      }, 0);
+
+      async function readGeoJSONFile(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(new Error('Failed to read file'));
+          reader.onload = () => {
+            try {
+              const data = JSON.parse(String(reader.result));
+              resolve(data);
+            } catch (e) {
+              reject(new Error('Invalid JSON in file'));
+            }
+          };
+          reader.readAsText(file);
+        });
+      }
+
+      function addLayers(clusterEnabled) {
+        // Cluster circles
+        if (clusterEnabled) {
+          map.addLayer({
+            id: 'clusters',
+            type: 'circle',
+            source: 'duos',
+            filter: ['has', 'point_count'],
+            paint: {
+              'circle-color': [
+                'step', ['get', 'point_count'],
+                '#93c5fd', 25, '#60a5fa', 50, '#2563eb'
+              ],
+              'circle-radius': [
+                'step', ['get', 'point_count'],
+                16, 25, 22, 50, 28
+              ],
+              'circle-opacity': 0.85
+            }
+          });
+          // Cluster count labels
+          map.addLayer({
+            id: 'cluster-count',
+            type: 'symbol',
+            source: 'duos',
+            filter: ['has', 'point_count'],
+            layout: {
+              'text-field': ['get', 'point_count_abbreviated'],
+              'text-font': ['DIN Pro Medium', 'Arial Unicode MS Bold'],
+              'text-size': 12
+            },
+            paint: { 'text-color': '#0f172a' }
+          });
+        }
+        // Unclustered points
+        map.addLayer({
+          id: 'unclustered',
+          type: 'circle',
+          source: 'duos',
+          filter: ['!', ['has', 'point_count']],
+          paint: {
+            'circle-radius': 7,
+            'circle-color': '#e11d48',
+            'circle-stroke-color': '#ffffff',
+            'circle-stroke-width': 1.5
+          }
+        });
+      }
+
+      function makePopupHTML(props) {
+        const safe = (v) => (v == null || v === '' ? '-' : String(v));
+        const rows = [
+          ['Namen', `${safe(props.naamA)} & ${safe(props.naamB)}`],
+          ['Adres', `${safe(props.adres)} ${safe(props.postcode)}`],
+          ['Team', `${safe(props.teamA)} / ${safe(props.teamB)}`],
+          ['Dieet', safe(props.dieet)],
+          ['Allergie', safe(props.allergie)],
+          ['Notitie', safe(props.opmerking)],
+        ];
+        return '<div class="popup">' + rows.map(([k, v]) => `<div><b>${k}</b> ${v}</div>`).join('') + '</div>';
+      }
+
+      function wireInteractions() {
+        // Zoom into clusters
+        map.on('click', 'clusters', (e) => {
+          const features = map.queryRenderedFeatures(e.point, { layers: ['clusters'] });
+          const clusterId = features[0].properties.cluster_id;
+          map.getSource('duos').getClusterExpansionZoom(clusterId, (err, zoom) => {
+            if (err) return;
+            map.easeTo({ center: features[0].geometry.coordinates, zoom });
+          });
+        });
+        map.on('mouseenter', 'clusters', () => { map.getCanvas().style.cursor = 'pointer'; });
+        map.on('mouseleave', 'clusters', () => { map.getCanvas().style.cursor = ''; });
+
+        // Popups for points
+        const popup = new mapboxgl.Popup({ closeButton: true, closeOnClick: true });
+        map.on('click', 'unclustered', (e) => {
+          const feature = e.features && e.features[0];
+          if (!feature) return;
+          const html = makePopupHTML(feature.properties || {});
+          popup.setLngLat(feature.geometry.coordinates).setHTML(html).addTo(map);
+        });
+        map.on('mouseenter', 'unclustered', () => { map.getCanvas().style.cursor = 'pointer'; });
+        map.on('mouseleave', 'unclustered', () => { map.getCanvas().style.cursor = ''; });
+      }
+
+      function fitToBounds(geojson) {
+        if (!geojson.features || !geojson.features.length) return;
+        const bounds = new mapboxgl.LngLatBounds();
+        for (const f of geojson.features) {
+          if (f.geometry && f.geometry.type === 'Point') {
+            bounds.extend(f.geometry.coordinates);
+          }
+        }
+        if (!bounds.isEmpty()) {
+          map.fitBounds(bounds, { padding: 40, maxZoom: 15 });
+        }
+      }
+
+      function removeIfExists(id, type) {
+        try {
+          if (type === 'layer' && map.getLayer(id)) map.removeLayer(id);
+          if (type === 'source' && map.getSource(id)) map.removeSource(id);
+        } catch (e) { /* ignore */ }
+      }
+
+      async function setClustering(clusterEnabled, data) {
+        // Remove layers and source (order matters)
+        removeIfExists('cluster-count', 'layer');
+        removeIfExists('clusters', 'layer');
+        removeIfExists('unclustered', 'layer');
+        removeIfExists('duos', 'source');
+
+        map.addSource('duos', {
+          type: 'geojson',
+          data,
+          cluster: !!clusterEnabled,
+          clusterMaxZoom: 14,
+          clusterRadius: 50
+        });
+        addLayers(!!clusterEnabled);
+      }
+
+      // Custom groups state
+      const customToggle = document.getElementById('customToggle');
+      const clusterToggle = document.getElementById('clusterToggle');
+      const fileInput = document.getElementById('fileGeoJSON');
+      const exportBtn = document.getElementById('exportGroups');
+      const groupsClearBtn = document.getElementById('clearGroups');
+      const panel = document.getElementById('groupPanel');
+      const groupList = document.getElementById('groupList');
+      const panelExport = document.getElementById('panelExport');
+      const panelClear = document.getElementById('panelClear');
+      const CUSTOM_STORAGE_KEY = 'CUSTOM_GROUPS_V1';
+      let sourceData = null; // geojson of points
+      let interactionsWired = false;
+
+      function getGroupPalette(names) {
+        const base = ['#e11d48','#2563eb','#059669','#b45309','#7c3aed','#0ea5e9','#16a34a','#dc2626','#eab308','#1d4ed8','#14b8a6','#ef4444','#a855f7'];
+        if (!names || names.length === 0) return '#e11d48';
+        const expr = ['match', ['get','group']];
+        names.forEach((n, i) => { expr.push(n, base[i % base.length]); });
+        expr.push('#e11d48'); // default
+        return expr;
+      }
+
+      function applyGroupStyling() {
+        if (!map.getLayer('unclustered')) return;
+        const names = Array.from(new Set((sourceData.features||[]).map(f => f.properties && f.properties.group).filter(Boolean)));
+        map.setPaintProperty('unclustered', 'circle-color', getGroupPalette(names));
+      }
+
+      function recalcAssignments() {
+        if (!sourceData) return;
+        const drawn = Draw.getAll();
+        // reset groups
+        sourceData.features.forEach(f => { if (f.properties) delete f.properties.group; });
+        for (const poly of drawn.features) {
+          if (!poly || !poly.geometry || poly.geometry.type !== 'Polygon') continue;
+          const label = (poly.properties && poly.properties.label) || '';
+          if (!label) continue;
+          const within = turf.pointsWithinPolygon(sourceData, poly);
+          (within.features || []).forEach(w => {
+            const id = w.properties && w.properties.row;
+            // find original feature by row id
+            const orig = sourceData.features.find(ff => ff.properties && ff.properties.row == id);
+            if (orig && orig.properties) orig.properties.group = label;
+          });
+        }
+        // Update source with new properties
+        if (map.getSource('duos')) {
+          map.getSource('duos').setData(sourceData);
+        }
+        applyGroupStyling();
+        persistCustom();
+      }
+
+      function persistCustom() {
+        try {
+          const payload = { polygons: Draw.getAll() };
+          localStorage.setItem(CUSTOM_STORAGE_KEY, JSON.stringify(payload));
+        } catch (e) { /* ignore quota */ }
+      }
+
+      function restoreCustom() {
+        try {
+          const raw = localStorage.getItem(CUSTOM_STORAGE_KEY);
+          if (!raw) return false;
+          const payload = JSON.parse(raw);
+          if (payload && payload.polygons && payload.polygons.type === 'FeatureCollection') {
+            Draw.set(payload.polygons);
+            return true;
+          }
+          return false;
+        } catch { return false; }
+      }
+
+      function enableCustomUI(on) {
+        // Show/hide drawing toolbar, keep polygons on map always
+        if (drawControlEl) drawControlEl.style.display = on ? 'block' : 'none';
+        // cluster toggle disabled when custom is on
+        clusterToggle.disabled = on;
+        // Always keep the panel visible if groups exist
+        updateGroupPanel();
+      }
+
+      function setDataDependentUI(enabled) {
+        clusterToggle.disabled = !enabled || customToggle.checked; // disabled until data loaded
+        customToggle.disabled = !enabled; // drawing depends on data presence for assignments
+        if (!enabled) {
+          panel.style.display = 'none';
+          exportBtn.style.display = 'none';
+          groupsClearBtn.style.display = 'none';
+        }
+      }
+
+      function wireCustomEvents() {
+        map.on('draw.create', (e) => {
+          const id = e.features && e.features[0] && e.features[0].id;
+          if (!id) return;
+          const name = prompt('Name this group', 'G' + (Draw.getAll().features.length));
+          if (name) {
+            try { Draw.setFeatureProperty(id, 'label', name); } catch (err) {}
+          }
+          recalcAssignments();
+          updateGroupPanel();
+        });
+        map.on('draw.update', () => { recalcAssignments(); updateGroupPanel(); });
+        map.on('draw.delete', () => { recalcAssignments(); updateGroupPanel(); });
+
+        function csvEscape(val) {
+          if (val == null) return '';
+          const s = String(val);
+          if (s.includes('"') || s.includes(',') || s.includes('\n')) {
+            return '"' + s.replace(/"/g, '""') + '"';
+          }
+          return s;
+        }
+        function exportCSV() {
+          const rows = [
+            ['row','group','adres','postcode','stad','naamA','naamB','teamA','teamB']
+          ];
+          (sourceData.features||[])
+            .filter(f => f.properties && f.properties.group)
+            .forEach(f => {
+              const p = f.properties;
+              rows.push([p.row, p.group, p.adres, p.postcode, p.stad, p.naamA, p.naamB, p.teamA, p.teamB]);
+            });
+          const csv = rows.map(r => r.map(csvEscape).join(',')).join('\n');
+          const blob = new Blob([csv], { type: 'text/csv' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = 'custom_groups.csv';
+          a.click();
+          URL.revokeObjectURL(a.href);
+        }
+        exportBtn.onclick = exportCSV;
+        panelExport.onclick = exportCSV;
+        function clearGroups() {
+          Draw.deleteAll();
+          if (sourceData) sourceData.features.forEach(f => { if (f.properties) delete f.properties.group; });
+          if (map.getSource('duos')) map.getSource('duos').setData(sourceData);
+          applyGroupStyling();
+          localStorage.removeItem(CUSTOM_STORAGE_KEY);
+          updateGroupPanel();
+        }
+        groupsClearBtn.onclick = clearGroups;
+        panelClear.onclick = clearGroups;
+      }
+
+      function updateGroupPanel() {
+        const polys = Draw.getAll().features || [];
+        const groups = polys
+          .filter(f => f.properties && f.properties.label)
+          .map(f => ({ name: f.properties.label, id: f.id, geom: f.geometry }));
+        if (groups.length === 0) {
+          panel.style.display = 'none';
+          exportBtn.style.display = 'none';
+          groupsClearBtn.style.display = 'none';
+          return;
+        }
+        // Build counts per group from assigned points
+        const counts = {};
+        (sourceData.features||[]).forEach(f => {
+          const g = f.properties && f.properties.group;
+          if (!g) return;
+          counts[g] = (counts[g] || 0) + 1;
+        });
+        groupList.innerHTML = '';
+        groups.forEach(g => {
+          const li = document.createElement('li');
+          const left = document.createElement('span');
+          left.textContent = g.name;
+          const right = document.createElement('span');
+          right.className = 'pill';
+          right.textContent = counts[g.name] ? counts[g.name] + ' pts' : '0 pts';
+          li.appendChild(left); li.appendChild(right);
+          li.title = 'Click to zoom to this group';
+          li.style.cursor = 'pointer';
+          li.onclick = () => {
+            try {
+              const b = turf.bbox({ type:'Feature', geometry: g.geom, properties:{} });
+              map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 40, maxZoom: 15 });
+            } catch (e) { /* ignore */ }
+          };
+          groupList.appendChild(li);
+        });
+        panel.style.display = 'block';
+        exportBtn.style.display = 'inline-block';
+        groupsClearBtn.style.display = 'inline-block';
+      }
+
+      map.on('load', async () => {
+        try {
+          setDataDependentUI(false);
+          enableCustomUI(false);
+          if (!interactionsWired) { wireCustomEvents(); wireInteractions(); interactionsWired = true; }
+
+          // When a file is chosen, read and load it
+          fileInput.addEventListener('change', async (e) => {
+            const file = e.target.files && e.target.files[0];
+            if (!file) return;
+            try {
+              const data = await readGeoJSONFile(file);
+              if (!data || data.type !== 'FeatureCollection') throw new Error('Expected a GeoJSON FeatureCollection');
+              sourceData = data;
+              const clusterPref = localStorage.getItem('CLUSTER_ENABLED');
+              const clusterEnabled = clusterPref == null ? true : clusterPref === 'true';
+              clusterToggle.checked = clusterEnabled;
+              await setClustering(clusterEnabled, sourceData);
+              fitToBounds(sourceData);
+              // Recalculate any existing custom groups assignments for this dataset
+              if (!restoreCustom()) { /* polygons none -> nothing to do */ }
+              recalcAssignments();
+              applyGroupStyling();
+              updateGroupPanel();
+              setDataDependentUI(true);
+            } catch (err) {
+              console.error(err);
+              alert('Failed to read GeoJSON: ' + (err && err.message ? err.message : err));
+            }
+          });
+
+          // Cluster toggle reacts after data is loaded
+          document.getElementById('clusterToggle').addEventListener('change', async (e) => {
+            if (!sourceData) return;
+            const on = e.target.checked;
+            localStorage.setItem('CLUSTER_ENABLED', String(on));
+            await setClustering(on, sourceData);
+            applyGroupStyling();
+          });
+
+          // Custom groups toggle
+          customToggle.addEventListener('change', async (e) => {
+            const on = e.target.checked;
+            enableCustomUI(on);
+            if (!sourceData) return;
+            if (on) {
+              // Ensure clustering is off when custom is on
+              if (clusterToggle.checked) { clusterToggle.checked = false; localStorage.setItem('CLUSTER_ENABLED', 'false'); await setClustering(false, sourceData); }
+              recalcAssignments();
+              applyGroupStyling();
+              updateGroupPanel();
+            } else {
+              // Reset styling to default color
+              if (map.getLayer('unclustered')) {
+                map.setPaintProperty('unclustered', 'circle-color', '#e11d48');
+              }
+              updateGroupPanel();
+            }
+          });
+        } catch (err) {
+          console.error(err);
+          alert('Initialization error.');
+        }
+      });
+    </script>
+  </body>
+  </html>
